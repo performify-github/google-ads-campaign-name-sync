@@ -2,45 +2,50 @@
  * Sync campaign & ad group names into Google Ads custom parameters
  * ================================================================
  *
- * A Google Ads Script that keeps a {_campaign} custom parameter on every
- * campaign and a {_adgroup} custom parameter on every ad group, each holding
- * the entity's own (URL-encoded) name. Your tracking template can then pass
- * human-readable names to any analytics or call-tracking platform — Infinity,
- * or anything else that reads them from the landing-page URL.
+ * A Google Ads Script that keeps a {_campaign} custom parameter on each
+ * enabled campaign and a {_adgroup} custom parameter on each ad group in an
+ * enabled campaign, each holding the entity's own (URL-encoded) name. Your
+ * tracking template can then pass readable names to any analytics or
+ * call-tracking platform: Infinity, or anything else that reads them from the
+ * landing page URL.
  *
  * Why this exists
  * ---------------
- * The commonly shared version of this script updates campaigns through
- * AdsApp.bulkUploads() (a CSV bulk upload). Bulk uploads do not apply
- * campaign edits to Performance Max campaigns, and the script gets no
- * per-row feedback — so PMax campaigns silently never receive their
- * {_campaign} parameter, while everything looks fine in the logs.
+ * The version of this script that a call-tracking vendor gave its customers
+ * updated campaigns through AdsApp.bulkUploads() (a CSV bulk upload). Bulk
+ * uploads don't apply custom parameter edits to Performance Max campaigns,
+ * and the upload reports nothing back to the script, so PMax campaigns never
+ * received their {_campaign} parameter while the logs looked fine.
  *
- * This version sets custom parameters DIRECTLY on each entity via
- * entity.urls().setCustomParameters(), which Google Ads Scripts now supports
- * for every campaign type, including Performance Max
- * (AdsApp.performanceMaxCampaigns()).
+ * This version sets custom parameters directly on each entity via
+ * entity.urls().setCustomParameters(). Performance Max has its own selector
+ * (AdsApp.performanceMaxCampaigns()) and supports this exactly as Search and
+ * Display campaigns do.
  *
  * What it covers
  * --------------
- *  - Campaigns: Search/Display, Performance Max, Shopping, Video, and
- *    Demand Gen (when the Scripts runtime exposes the selector).
+ *  - Campaigns: Search, Display, Performance Max and Shopping.
+ *  - Not covered: Demand Gen (Scripts has no Demand Gen selector) and Video
+ *    (AdsApp.VideoCampaign has no urls() method; the script logs one line and
+ *    skips that source).
  *  - Ad groups: standard (Search/Display) and Shopping.
- *  - Performance Max has asset groups instead of ad groups. Asset groups
- *    cannot be edited by Scripts yet (AssetGroupUrls has no custom-parameter
- *    methods), but you can set the parameter once by hand — see the README's
- *    "Performance Max and asset groups" section for the {_adgroup} override
- *    trick using the new "Asset group URL options" in the Google Ads UI.
+ *  - Performance Max has asset groups instead of ad groups. Scripts'
+ *    AssetGroupUrls object can't set custom parameters (it only exposes final
+ *    URL and path methods). The Google Ads API added asset group URL options
+ *    in v25.2 (23 September 2026), so AdsApp.mutate() may be able to set them,
+ *    but this script doesn't try that: it's untested. Set the parameter by
+ *    hand whenever you create or rename an asset group; see the README's
+ *    "Performance Max and asset groups" section for the {_adgroup} override.
  *
  * Behaviour
  * ---------
- *  - MERGES with existing custom parameters instead of replacing them
+ *  - Merges with existing custom parameters instead of replacing them
  *    (setCustomParameters replaces the whole set, so we read-modify-write).
- *  - Updates whenever the stored value differs from the current name —
- *    that covers missing parameters, blanked values, AND renamed entities.
+ *  - Updates whenever the stored value differs from the current name, which
+ *    covers missing parameters, blanked values and renamed entities.
  *  - Skips (with a logged warning) entities already carrying the maximum
- *    8 custom parameters, or whose encoded name exceeds the 200-character
- *    value limit, rather than failing the run.
+ *    8 custom parameters, or whose encoded name exceeds the 200-byte value
+ *    limit, rather than failing the run.
  *  - Logs one line per change, a summary per entity source, and a grand
  *    total. Throws at the end if any entity errored, so a scheduled run
  *    shows as Failed and triggers Google's script-failure email.
@@ -49,7 +54,7 @@
  * -----
  *  1. Google Ads > Tools > Bulk actions > Scripts > new script; paste this in.
  *  2. Authorise the script when prompted.
- *  3. Click PREVIEW first — preview saves nothing, but the log shows exactly
+ *  3. Click PREVIEW first. Preview saves nothing, but the log shows exactly
  *     what a live run would change.
  *  4. Run once live, then schedule it hourly or daily. New or renamed
  *     campaigns and ad groups are picked up on the next run.
@@ -60,8 +65,8 @@
 const CAMPAIGN_PARAM_KEY = 'campaign';
 const AD_GROUP_PARAM_KEY = 'adgroup';
 
-// Google Ads limits: at most 8 custom parameters per entity, and parameter
-// values are capped at 200 characters. (Keys are capped at 16.)
+// Google Ads Scripts limits: at most 8 custom parameters per entity, and
+// parameter values are capped at 200 bytes. (Keys are capped at 16 bytes.)
 const MAX_CUSTOM_PARAMS = 8;
 const MAX_VALUE_LENGTH = 200; // encodeURIComponent output is ASCII, so chars == bytes
 
@@ -74,7 +79,7 @@ function main() {
   // Aggregated counters across every entity source, for the final summary.
   const totals = { scanned: 0, updated: 0, unchanged: 0, skipped: 0, errors: 0 };
 
-  // Each campaign type lives behind its own selector in Google Ads Scripts —
+  // Each campaign type lives behind its own selector in Google Ads Scripts:
   // AdsApp.campaigns() only returns Search and Display campaigns. This list
   // is why the script works for Performance Max where bulk-upload versions
   // silently don't.
@@ -82,13 +87,13 @@ function main() {
     ['Search/Display campaigns', () => AdsApp.campaigns()],
     ['Performance Max campaigns', () => AdsApp.performanceMaxCampaigns()],
     ['Shopping campaigns', () => AdsApp.shoppingCampaigns()],
+    // AdsApp.VideoCampaign has no urls() method, so syncSource logs one line
+    // and skips this source. It stays listed so the log says Video campaigns
+    // weren't covered, and so they'd be picked up if Google adds urls().
     ['Video campaigns', () => AdsApp.videoCampaigns()],
   ];
-  // Demand Gen support is newer; include it only where the runtime has it,
-  // so the script keeps working on older runtimes too.
-  if (typeof AdsApp.demandGenCampaigns === 'function') {
-    campaignSources.push(['Demand Gen campaigns', () => AdsApp.demandGenCampaigns()]);
-  }
+  // Demand Gen campaigns have no AdsApp selector (Scripts reaches them only
+  // through AdsApp.search() and AdsApp.mutate()), so they aren't covered.
 
   for (const [label, getSelector] of campaignSources) {
     syncSource(label, getSelector, CAMPAIGN_PARAM_KEY, totals);
@@ -147,13 +152,23 @@ function syncSource(label, getSelector, paramKey, totals) {
 
   while (iterator.hasNext()) {
     const entity = iterator.next();
+
+    // Guard: some entity types (Video campaigns, for one) have no urls()
+    // method, so custom parameters can't be set on them from Scripts. Skip
+    // the whole source with one log line instead of erroring per entity,
+    // which would mark the run Failed.
+    if (typeof entity.urls !== 'function') {
+      console.warn(`[${label}] entities have no urls() method in Scripts, skipping this source`);
+      return;
+    }
+
     s.scanned++;
     let name = '(unknown)';
     try {
       name = entity.getName();
       const value = encodeName(name);
 
-      // Guard: parameter values are capped at 200 characters. A truncated
+      // Guard: parameter values are capped at 200 bytes. A truncated
       // value would decode incorrectly, so skip and warn instead.
       if (value.length > MAX_VALUE_LENGTH) {
         console.warn(
